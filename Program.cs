@@ -30,14 +30,7 @@ UpstreamTarget GetNextTarget()
     };
 }
 
-// In a real system this would be in a separate file
-var apiApp = WebApplication.CreateBuilder(args).Build();
-
-apiApp.MapGet("/stats", () =>
-{
-    var data = TokenSessionTracker.GetSnapshot();
-    return Results.Json(data);
-});
+var apiApp = ProxyApi.CreateApiApp(args);
 
 _ = apiApp.RunAsync("http://localhost:9000");
 
@@ -58,13 +51,17 @@ while (true)
 
 async Task HandleConnectionAsync(TcpClient inbound)
 {
+    var node = UpstreamManager.GetResidentialNodes().FirstOrDefault();
     var reader = new StreamReader(inbound.GetStream());
     var requestLine = await reader.ReadLineAsync();
     string? requestedHost = null;
     int requestedPort = 80;
 
-    if (requestLine == null || !requestLine.StartsWith("CONNECT") && !requestLine.StartsWith("GET"))
+    if (requestLine == null || !requestLine.StartsWith("CONNECT") && !requestLine.StartsWith("GET") && !requestLine.StartsWith("HEAD") && !requestLine.StartsWith("POST"))
     {
+        Log.Warning($"[INVALID] Invalid request from {((IPEndPoint)inbound.Client.RemoteEndPoint).Address}");
+        var writer = new StreamWriter(inbound.GetStream()) { AutoFlush = true };
+        await writer.WriteAsync("HTTP/1.1 400 Bad Request\r\n\r\nInvalid request");
         inbound.Close();
         return;
     }
@@ -117,6 +114,18 @@ async Task HandleConnectionAsync(TcpClient inbound)
         inbound.Close();
         return;
     }
+
+    if (node == null)
+    {
+        Log.Warning("No live residential node available.");
+        var writer = new StreamWriter(inbound.GetStream()) { AutoFlush = true };
+        await writer.WriteAsync("HTTP/1.1 502 Bad Gateway\r\n\r\nNo residential node available");
+        inbound.Close();
+        return;
+    }
+
+    requestedHost = node.Host;
+    requestedPort = node.Port;
 
     var stopwatch = Stopwatch.StartNew();
     long bytesUp = 0;
@@ -181,6 +190,15 @@ async Task HandleConnectionAsync(TcpClient inbound)
     finally
     {
         stopwatch.Stop();
+        var ip = ((IPEndPoint)inbound.Client.RemoteEndPoint!).Address.ToString();
+
+        string? country = null;
+        string? city = null;
+
+        // Optional lookup
+        (country, city) = await ApiClient.GetGeoInfo(ip);
+
+        IPSessionLogger.Log(token!, ip, bytesUp, bytesDown, country, city);
         Log.Information("Connection closed: {ClientIP} → {Host}:{Port} | {Duration}ms | ↑{BytesUp} ↓{BytesDown}",
             ((IPEndPoint)inbound.Client.RemoteEndPoint).Address,
             requestedHost, requestedPort,

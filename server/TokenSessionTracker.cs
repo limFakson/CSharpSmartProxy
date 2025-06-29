@@ -1,50 +1,56 @@
-public class TokenSession
-{
-    public int ActiveConnections { get; set; }
-    public long TotalBytesUp { get; set; }
-    public long TotalBytesDown { get; set; }
-    public int TotalRequests { get; set; }
-    public bool IsBlocked { get; set; }
-    public DateTime LastActivity { get; set; } = DateTime.UtcNow;
-}
+using Microsoft.EntityFrameworkCore;
 
 public static class TokenSessionTracker
 {
-    private static readonly Dictionary<string, TokenSession> Sessions = new();
+    private static readonly Dictionary<string, ActiveTokenState> ActiveTokens = new();
     private static readonly object LockObj = new();
 
     public static void RecordStart(string token)
     {
         lock (LockObj)
         {
-            if (!Sessions.ContainsKey(token))
-                Sessions[token] = new TokenSession();
+            if (!ActiveTokens.ContainsKey(token))
+                ActiveTokens[token] = new ActiveTokenState();
 
-            Sessions[token].ActiveConnections++;
-            Sessions[token].TotalRequests++;
-            Sessions[token].LastActivity = DateTime.UtcNow;
+            ActiveTokens[token].ActiveConnections++;
+            ActiveTokens[token].LastActivity = DateTime.UtcNow;
         }
+
+        var optionsBuilder = new DbContextOptionsBuilder<SessionDbContext>();
+
+        using var db = new SessionDbContext(optionsBuilder.Options);
+        db.Sessions.Add(new TokenSession
+        {
+            Token = token,
+            StartedAt = DateTime.UtcNow
+        });
+        db.SaveChanges();
     }
 
     public static void RecordStop(string token, long up, long down)
     {
         lock (LockObj)
         {
-            if (Sessions.ContainsKey(token))
+            if (ActiveTokens.TryGetValue(token, out var state))
             {
-                Sessions[token].ActiveConnections--;
-                Sessions[token].TotalBytesUp += up;
-                Sessions[token].TotalBytesDown += down;
-                Sessions[token].LastActivity = DateTime.UtcNow;
+                state.ActiveConnections--;
+                state.LastActivity = DateTime.UtcNow;
             }
         }
-    }
+        var optionsBuilder = new DbContextOptionsBuilder<SessionDbContext>();
 
-    public static Dictionary<string, TokenSession> GetSnapshot()
-    {
-        lock (LockObj)
+        using var db = new SessionDbContext(optionsBuilder.Options);
+        var session = db.Sessions
+            .Where(s => s.Token == token && s.EndedAt == null)
+            .OrderByDescending(s => s.StartedAt)
+            .FirstOrDefault();
+
+        if (session != null)
         {
-            return Sessions.ToDictionary(kvp => kvp.Key, kvp => kvp.Value);
+            session.EndedAt = DateTime.UtcNow;
+            session.BytesUp = up;
+            session.BytesDown = down;
+            db.SaveChanges();
         }
     }
 
@@ -52,21 +58,55 @@ public static class TokenSessionTracker
     {
         lock (LockObj)
         {
-            if (!Sessions.ContainsKey(token)) return false;
-
-            var session = Sessions[token];
-
-            if (session.IsBlocked) return true;
-
-            if (session.ActiveConnections > limits.MaxConnectionsPerToken ||
-                session.TotalRequests > limits.MaxRequestsPerToken)
+            if (ActiveTokens.TryGetValue(token, out var state))
             {
-                session.IsBlocked = true;
-                return true;
+                if (state.IsBlocked) return true;
+                if (state.ActiveConnections > limits.MaxConnectionsPerToken)
+                {
+                    state.IsBlocked = true;
+                    return true;
+                }
             }
+        }
 
-            return false;
+        var optionsBuilder = new DbContextOptionsBuilder<SessionDbContext>();
+
+        // DB-based traffic limit (last X mins)
+        using var db = new SessionDbContext(optionsBuilder.Options);
+        var since = DateTime.UtcNow.AddMinutes(-limits.TimeframeMinutes);
+
+        var totalBytes = db.Sessions
+            .Where(s => s.Token == token && s.StartedAt >= since)
+            .Sum(s => s.BytesUp + s.BytesDown);
+
+        return totalBytes >= limits.ByteLimit;
+    }
+
+    public static void BlockToken(string token)
+    {
+        lock (LockObj)
+        {
+            if (!ActiveTokens.ContainsKey(token))
+                ActiveTokens[token] = new ActiveTokenState();
+
+            ActiveTokens[token].IsBlocked = true;
+        }
+    }
+
+    public static void UnblockToken(string token)
+    {
+        lock (LockObj)
+        {
+            if (ActiveTokens.TryGetValue(token, out var state))
+                state.IsBlocked = false;
+        }
+    }
+
+    public static Dictionary<string, ActiveTokenState> GetSnapshot()
+    {
+        lock (LockObj)
+        {
+            return ActiveTokens.ToDictionary(k => k.Key, v => v.Value);
         }
     }
 }
-
