@@ -1,30 +1,32 @@
-// Script for fetching valid tokens from PostgresSQL DB
 using Npgsql;
-
+// Script for fetching valid tokens from PostgresSQL DB
 public static class TokenFetcher
 {
-    public static async Task<List<string>> GetValidTokensAsync(string token)
+    public static async Task<HashSet<string>> GetValidTokensAsync()
     {
         var connString = Environment.GetEnvironmentVariable("POSTGRES_URL");
+        var psqlProvider = new PostgresTokenProvider(connString);
 
-        if (string.IsNullOrWhiteSpace(connString))
-            throw new InvalidOperationException("POSTGRES_URL is not set in environment.");
-
-        var tokens = new List<string>();
-
-        await using var conn = new NpgsqlConnection(connString);
-        await conn.OpenAsync();
-
-        const string query = "SELECT token FROM proxy_tokens WHERE is_active = TRUE";
-
-        await using var cmd = new NpgsqlCommand(query, conn);
-        await using var reader = await cmd.ExecuteReaderAsync();
-
-        while (await reader.ReadAsync())
+        var tokens = await psqlProvider.GetActiveTokensAsync();
+        if (tokens == null)
         {
-            tokens.Add(reader.GetString(0));
+            throw new InvalidOperationException("Postgres token provider is not configured.");
         }
 
-        return tokens;
+        return new HashSet<string>(tokens);
+    }
+
+    public static async Task<bool> TableExistsAsync(string tableName = "ProxyTokens")
+    {
+        var _connectionString = Environment.GetEnvironmentVariable("POSTGRES_URL");
+        using var conn = new NpgsqlConnection(_connectionString);
+        await conn.OpenAsync();
+
+        var cmd = new NpgsqlCommand(
+            "SELECT EXISTS (SELECT 1 FROM information_schema.tables WHERE table_schema = 'public' AND table_name = @tableName);",
+            conn);
+        cmd.Parameters.AddWithValue("tableName", tableName);
+
+        return (bool)await cmd.ExecuteScalarAsync();
     }
 }
