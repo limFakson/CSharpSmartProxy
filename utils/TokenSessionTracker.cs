@@ -5,7 +5,7 @@ public static class TokenSessionTracker
     private static readonly Dictionary<string, ActiveTokenState> ActiveTokens = new();
     private static readonly object LockObj = new();
 
-    public static void RecordStart(string token)
+    public static async Task RecordStartAsync(string token)
     {
         lock (LockObj)
         {
@@ -19,15 +19,15 @@ public static class TokenSessionTracker
         var optionsBuilder = new DbContextOptionsBuilder<SessionDbContext>();
 
         using var db = new SessionDbContext(optionsBuilder.Options);
-        db.Sessions.Add(new TokenSession
+        await db.Sessions.AddAsync(new TokenSession
         {
             Token = token,
             StartedAt = DateTime.UtcNow
         });
-        db.SaveChanges();
+        await db.SaveChangesAsync();
     }
 
-    public static void RecordStop(string token, long up, long down)
+    public static async Task RecordStopAsync(string token, long up, long down)
     {
         lock (LockObj)
         {
@@ -40,10 +40,10 @@ public static class TokenSessionTracker
         var optionsBuilder = new DbContextOptionsBuilder<SessionDbContext>();
 
         using var db = new SessionDbContext(optionsBuilder.Options);
-        var session = db.Sessions
+        var session = await db.Sessions
             .Where(s => s.Token == token && s.EndedAt == null)
             .OrderByDescending(s => s.StartedAt)
-            .FirstOrDefault();
+            .FirstOrDefaultAsync();
 
         if (session != null)
         {
@@ -54,8 +54,9 @@ public static class TokenSessionTracker
         }
     }
 
-    public static bool IsTokenBlocked(string token, LimitSettings limits)
+    public static async Task<bool> IsTokenBlocked(string token, LimitSettings limits)
     {
+        Console.WriteLine("🛂 Checking token block status for {Token}", token);
         lock (LockObj)
         {
             if (ActiveTokens.TryGetValue(token, out var state))
@@ -75,9 +76,9 @@ public static class TokenSessionTracker
         using var db = new SessionDbContext(optionsBuilder.Options);
         var since = DateTime.UtcNow.AddMinutes(-limits.TimeframeMinutes);
 
-        var totalBytes = db.Sessions
+        var totalBytes = await db.Sessions
             .Where(s => s.Token == token && s.StartedAt >= since)
-            .Sum(s => s.BytesUp + s.BytesDown);
+            .SumAsync(s => s.BytesUp + s.BytesDown);
 
         return totalBytes >= limits.ByteLimit;
     }

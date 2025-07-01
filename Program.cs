@@ -58,7 +58,7 @@ async Task Main()
     });
     Log.Information("Loaded {Count} tokens from PostgreSQL", validPSQLTokens.Count);
     Log.Debug("Token loaded: {Token}", validPSQLTokens);
-    
+
     var rrCounter = 0;
     UpstreamTarget GetNextTarget()
     {
@@ -97,7 +97,12 @@ async Task Main()
         var requestLine = await reader.ReadLineAsync();
         string? requestedHost = null;
         int requestedPort = 80;
+        inbound.ReceiveTimeout = 5000; // 5 seconds
+        inbound.SendTimeout = 5000;
 
+        Log.Information("🔌 Handling connection from {IP}", ((IPEndPoint)inbound.Client.RemoteEndPoint).Address);
+
+        Log.Information("Raw request line: {Line}", requestLine);
         if (requestLine == null || !requestLine.StartsWith("CONNECT") && !requestLine.StartsWith("GET") && !requestLine.StartsWith("HEAD") && !requestLine.StartsWith("POST"))
         {
             Log.Warning($"[INVALID] Invalid request from {((IPEndPoint)inbound.Client.RemoteEndPoint).Address}");
@@ -110,45 +115,57 @@ async Task Main()
         string? token = null;
         string line;
 
-
+        var headers = new List<string>();
         while (!string.IsNullOrWhiteSpace(line = await reader.ReadLineAsync()))
         {
-            if (line.StartsWith("Host:", StringComparison.OrdinalIgnoreCase))
-            {
-                var hostHeader = line.Split(':', 2)[1].Trim();
+            headers.Add(line);
+        }
 
-                // Check if host includes a port (e.g., host:port)
-                if (hostHeader.Contains(":"))
+        Log.Information("🔍 Parsed headers: {Headers}", string.Join(", ", headers));
+        foreach (var header in headers)
+        {
+            if (header.StartsWith("X-", StringComparison.OrdinalIgnoreCase))
+            {
+                Console.WriteLine(header);
+                if (header.StartsWith("X-Forwarded-Host:", StringComparison.OrdinalIgnoreCase))
                 {
-                    var parts = hostHeader.Split(':');
-                    requestedHost = parts[0];
-                    requestedPort = int.Parse(parts[1]);
+                    var hostHeader = header.Split(':', 2)[1].Trim();
+                    Console.WriteLine(hostHeader);
+                    if (hostHeader.Contains(":"))
+                    {
+                        var parts = hostHeader.Split(':');
+                        requestedHost = parts[0];
+                        requestedPort = int.Parse(parts[1]);
+                    }
+                    else
+                    {
+                        requestedHost = hostHeader;
+                        requestedPort = requestLine.StartsWith("CONNECT") ? 443 : 80;
+                    }
+                }
+                else if (header.StartsWith("X-Proxy-Token:", StringComparison.OrdinalIgnoreCase))
+                {
+                    token = header.Split(':', 2)[1].Trim();
+                    Console.WriteLine(token);
                 }
                 else
                 {
-                    requestedHost = hostHeader;
-                    // 🟡 THIS LINE IS NEEDED 👇
-                    requestedPort = requestLine.StartsWith("CONNECT") ? 443 : 80;
+                    Log.Warning("No X-Proxy-Token or X-Forwarded-Host header found in request.");
                 }
             }
-
-            if (line.StartsWith("X-Proxy-Token:", StringComparison.OrdinalIgnoreCase))
-            {
-                token = line.Split(':', 2)[1].Trim();
-            }
         }
-
 
         if (string.IsNullOrWhiteSpace(token) || !validPSQLTokens.Contains(token))
         {
             Log.Warning($"[AUTH] Rejected connection from {((IPEndPoint)inbound.Client.RemoteEndPoint).Address}");
             var writer = new StreamWriter(inbound.GetStream()) { AutoFlush = true };
             await writer.WriteAsync("HTTP/1.1 403 Forbidden\r\n\r\nUnauthorized");
+            Log.Error($"Invalid or missing token, token is null - {string.IsNullOrWhiteSpace(token)} or it not in validPSQLTokens - {validPSQLTokens.Contains(token)}");
             inbound.Close();
             return;
         }
 
-        if (TokenSessionTracker.IsTokenBlocked(token, limitSettings))
+        if (await TokenSessionTracker.IsTokenBlocked(token, limitSettings))
         {
             Log.Warning("Blocked token tried to connect: {Token}", token);
             var writer = new StreamWriter(inbound.GetStream()) { AutoFlush = true };
@@ -157,7 +174,7 @@ async Task Main()
             return;
         }
 
-        if (node == null)
+        if (node == null || !node.IsOnline || !node.IsResidential)
         {
             Log.Warning("No live residential node available.");
             var writer = new StreamWriter(inbound.GetStream()) { AutoFlush = true };
@@ -178,6 +195,7 @@ async Task Main()
         int maxAttempts = 3;
         int attempts = 0;
 
+
         if (requestedHost == null)
         {
             Log.Warning("Host not found in request headers.");
@@ -187,7 +205,7 @@ async Task Main()
             return;
         }
 
-        TokenSessionTracker.RecordStart(token!);
+        await TokenSessionTracker.RecordStartAsync(token!);
         while (!connected && attempts < maxAttempts)
         {
             try
@@ -233,8 +251,8 @@ async Task Main()
             var inboundStream = inbound.GetStream();
             var outboundStream = outbound.GetStream();
 
-            var upTask = ProxyData(inboundStream, outboundStream, count => bytesUp += count);
-            var downTask = ProxyData(outboundStream, inboundStream, count => bytesDown += count);
+            var upTask = ProxyDataTransfer.ProxyData(inboundStream, outboundStream, count => bytesUp += count);
+            var downTask = ProxyDataTransfer.ProxyData(outboundStream, inboundStream, count => bytesDown += count);
 
             await Task.WhenAny(upTask, downTask);
         }
@@ -258,18 +276,7 @@ async Task Main()
 
             inbound?.Dispose();
             outbound?.Dispose();
-            TokenSessionTracker.RecordStop(token!, bytesUp, bytesDown);
-        }
-    }
-
-    async Task ProxyData(Stream source, Stream destination, Action<long> onBytesTransferred)
-    {
-        var buffer = new byte[8192];
-        int read;
-        while ((read = await source.ReadAsync(buffer.AsMemory(0, buffer.Length))) > 0)
-        {
-            await destination.WriteAsync(buffer.AsMemory(0, read));
-            onBytesTransferred(read);
+            await TokenSessionTracker.RecordStopAsync(token!, bytesUp, bytesDown);
         }
     }
 }
