@@ -15,7 +15,7 @@ public static class UpstreamManager
     {
         lock (Nodes)
         {
-            return Nodes.Where(n => n.IsResidential && n.IsOnline).ToList();
+            return Nodes.Where(n => n.IsResidential == true && n.IsOnline == true).ToList();
         }
     }
 

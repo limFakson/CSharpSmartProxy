@@ -8,6 +8,6 @@ public class SessionDbContextFactory : IDesignTimeDbContextFactory<SessionDbCont
         var optionsBuilder = new DbContextOptionsBuilder<SessionDbContext>();
         optionsBuilder.UseSqlite("Data Source=sessions.db");
 
-        return new SessionDbContext(optionsBuilder.Options);
+        return new SessionDbContext();
     }
 }

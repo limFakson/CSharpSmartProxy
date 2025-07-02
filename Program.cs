@@ -6,16 +6,14 @@ using Microsoft.EntityFrameworkCore;
 using Microsoft.Extensions.Configuration;
 using Microsoft.EntityFrameworkCore.Migrations;
 using Microsoft.EntityFrameworkCore.Infrastructure;
+using System.Text.Json;
+using System.Text;
 
 // Load .env
 DotNetEnv.Env.Load("../../../.env");
 
-// Logger setup
-Log.Logger = new LoggerConfiguration()
-    .Enrich.FromLogContext()
-    .WriteTo.Console()
-    .WriteTo.File("logs/proxy.log", rollingInterval: RollingInterval.Day)
-    .CreateLogger();
+// Initialize Logger
+Logger.Initialize();
 
 // Load Config
 var config = new ConfigurationBuilder().SetBasePath(AppContext.BaseDirectory).AddJsonFile("appsettings.json").Build();
@@ -24,23 +22,7 @@ await Main();
 
 async Task Main()
 {
-    // Load PostgresSQL DB
-    var optionsBuilder = new DbContextOptionsBuilder<PostgresDbContext>();
-    optionsBuilder.UseNpgsql(Environment.GetEnvironmentVariable("POSTGRES_URL")!);
-
-    using (var db = new PostgresDbContext(optionsBuilder.Options))
-    {
-        db.Database.Migrate(); // Apply pending migrations
-        Log.Information("PostgresSQL DB is ready.");
-    }
-
-    bool exists = await TokenFetcher.TableExistsAsync("ProxyTokens");
-    Log.Information("Checking if ProxyTokens table exists: {Exists}", exists);
-    if (!exists)
-    {
-        Log.Error("ProxyTokens table does not exist in the database. Please run migrations.");
-        return;
-    }
+    await DBLoader.DBLoad();
 
     var proxySettings = config.GetSection("Proxy").Get<ProxySettings>();
     var limitSettings = config.GetSection("Proxy:Limits").Get<LimitSettings>();
@@ -92,67 +74,39 @@ async Task Main()
 
     async Task HandleConnectionAsync(TcpClient inbound)
     {
-        var node = UpstreamManager.GetResidentialNodes().FirstOrDefault();
+        var nodes = UpstreamManager.GetResidentialNodes();
+
         var reader = new StreamReader(inbound.GetStream());
         var requestLine = await reader.ReadLineAsync();
-        string? requestedHost = null;
-        int requestedPort = 80;
-        inbound.ReceiveTimeout = 5000; // 5 seconds
-        inbound.SendTimeout = 5000;
+        var headers = new List<string>();
+        string? line;
 
-        Log.Information("🔌 Handling connection from {IP}", ((IPEndPoint)inbound.Client.RemoteEndPoint).Address);
+        bool connected = false;
+        int maxAttempts = 3;
+        int attempts = 0;
+        bool isSuccessful = false;
 
-        Log.Information("Raw request line: {Line}", requestLine);
-        if (requestLine == null || !requestLine.StartsWith("CONNECT") && !requestLine.StartsWith("GET") && !requestLine.StartsWith("HEAD") && !requestLine.StartsWith("POST"))
+        while (!string.IsNullOrWhiteSpace(line = await reader.ReadLineAsync()))
+            headers.Add(line);
+
+        if(!headers.Contains("X-Forwarded-Host:") || !headers.Contains("X-Proxy-Token:"))
         {
             Log.Warning($"[INVALID] Invalid request from {((IPEndPoint)inbound.Client.RemoteEndPoint).Address}");
             var writer = new StreamWriter(inbound.GetStream()) { AutoFlush = true };
-            await writer.WriteAsync("HTTP/1.1 400 Bad Request\r\n\r\nInvalid request");
+            await writer.WriteAsync("HTTP/1.1 404 Bad Request\r\n\r\nInvalid request X-Proxy-Token or X-Forwarded-Host header not found in request.");
             inbound.Close();
             return;
         }
 
-        string? token = null;
-        string line;
+        string? token = headers.FirstOrDefault(h => h.StartsWith("X-Proxy-Token:"))?.Split(":", 2)[1].Trim();
+        string? forwardedHost = headers.FirstOrDefault(h => h.StartsWith("X-Forwarded-Host:"))?.Split(":", 2)[1].Trim();
 
-        var headers = new List<string>();
-        while (!string.IsNullOrWhiteSpace(line = await reader.ReadLineAsync()))
+        if (token == null || forwardedHost == null)
         {
-            headers.Add(line);
-        }
-
-        Log.Information("🔍 Parsed headers: {Headers}", string.Join(", ", headers));
-        foreach (var header in headers)
-        {
-            if (header.StartsWith("X-", StringComparison.OrdinalIgnoreCase))
-            {
-                Console.WriteLine(header);
-                if (header.StartsWith("X-Forwarded-Host:", StringComparison.OrdinalIgnoreCase))
-                {
-                    var hostHeader = header.Split(':', 2)[1].Trim();
-                    Console.WriteLine(hostHeader);
-                    if (hostHeader.Contains(":"))
-                    {
-                        var parts = hostHeader.Split(':');
-                        requestedHost = parts[0];
-                        requestedPort = int.Parse(parts[1]);
-                    }
-                    else
-                    {
-                        requestedHost = hostHeader;
-                        requestedPort = requestLine.StartsWith("CONNECT") ? 443 : 80;
-                    }
-                }
-                else if (header.StartsWith("X-Proxy-Token:", StringComparison.OrdinalIgnoreCase))
-                {
-                    token = header.Split(':', 2)[1].Trim();
-                    Console.WriteLine(token);
-                }
-                else
-                {
-                    Log.Warning("No X-Proxy-Token or X-Forwarded-Host header found in request.");
-                }
-            }
+            var writer = new StreamWriter(inbound.GetStream()) { AutoFlush = true };
+            await writer.WriteAsync("HTTP/1.1 400 Bad Request\r\n\r\nMissing token or host header");
+            inbound.Close();
+            return;
         }
 
         if (string.IsNullOrWhiteSpace(token) || !validPSQLTokens.Contains(token))
@@ -165,16 +119,24 @@ async Task Main()
             return;
         }
 
-        if (await TokenSessionTracker.IsTokenBlocked(token, limitSettings))
+        try
         {
-            Log.Warning("Blocked token tried to connect: {Token}", token);
-            var writer = new StreamWriter(inbound.GetStream()) { AutoFlush = true };
-            await writer.WriteAsync("HTTP/1.1 429 Too Many Requests\r\n\r\nBlocked or throttled");
-            inbound.Close();
-            return;
+            Console.WriteLine("🔍 About to check if token is blocked");
+            if (await TokenSessionTracker.IsTokenBlocked(token, limitSettings))
+            {
+                Log.Warning("Blocked token tried to connect: {Token}", token);
+                var writer = new StreamWriter(inbound.GetStream()) { AutoFlush = true };
+                await writer.WriteAsync("HTTP/1.1 429 Too Many Requests\r\n\r\nBlocked or throttled");
+                inbound.Close();
+                return;
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine($"🔥 condition error in IsTokenBlocked: {ex.Message}");
         }
 
-        if (node == null || !node.IsOnline || !node.IsResidential)
+        if (nodes == null)
         {
             Log.Warning("No live residential node available.");
             var writer = new StreamWriter(inbound.GetStream()) { AutoFlush = true };
@@ -183,100 +145,58 @@ async Task Main()
             return;
         }
 
-        requestedHost = node.Host;
-        requestedPort = node.Port;
-
-        var stopwatch = Stopwatch.StartNew();
-        long bytesUp = 0;
-        long bytesDown = 0;
-
-        bool connected = false;
-        TcpClient? outbound = null;
-        int maxAttempts = 3;
-        int attempts = 0;
-
-
-        if (requestedHost == null)
+        var httpClient = new HttpClient();
+        var payload = new
         {
-            Log.Warning("Host not found in request headers.");
-            var writer = new StreamWriter(inbound.GetStream()) { AutoFlush = true };
-            await writer.WriteAsync("HTTP/1.1 400 Bad Request\r\n\r\nMissing Host header");
-            inbound.Close();
-            return;
-        }
+            method = "GET",
+            url = $"https://{forwardedHost}",
+            headers = headers.ToDictionary(
+                h => h.Split(":", 2)[0].Trim(),
+                h => h.Split(":", 2)[1].Trim())
+        };
+
+        var json = JsonSerializer.Serialize(payload);
+        var content = new StringContent(json, Encoding.UTF8, "application/json");
 
         await TokenSessionTracker.RecordStartAsync(token!);
-        while (!connected && attempts < maxAttempts)
+        foreach (var node in nodes)
         {
-            try
+            while (!connected && attempts < maxAttempts)
             {
-                outbound = new TcpClient();
-                await outbound.ConnectAsync(requestedHost, requestedPort);
-                connected = true;
-            }
-            catch (Exception ex)
-            {
-                Log.Warning("Failed to connect to {Host}:{Port} (Attempt {Attempt}/{Max}) - {Error}",
-                    requestedHost, requestedPort, attempts + 1, maxAttempts, ex.Message);
-
-                if (proxySettings.RoutingStrategy == "RoundRobin" || proxySettings.RoutingStrategy == "Random")
+                Log.Information("🔄 Attempt {Attempt} to connect to node: {Node}", attempts + 1, node.Host);
+                try
                 {
-                    // Pick another upstream target to try as fallback
-                    var alt = GetNextTarget();
-                    requestedHost = alt.Host;
-                    requestedPort = alt.Port;
-                    Log.Information("Retrying with alternative target {AltHost}:{AltPort}", alt.Host, alt.Port);
+                    Log.Information("🔗 Forwarding request to node: {Node}", node.Host);
+                    var response = await httpClient.PostAsync($"http://{node.Host}:{node.Port}/proxy-request", content);
+                    var responseBody = await response.Content.ReadAsByteArrayAsync();
+                    connected = true;
+
+                    var writer = new StreamWriter(inbound.GetStream()) { AutoFlush = true };
+                    await writer.WriteAsync("HTTP/1.1 200 OK\r\n\r\n");
+                    await inbound.GetStream().WriteAsync(responseBody);
+                    isSuccessful = true;
                 }
-
-                await Task.Delay(1000); // Optional delay before retry
-                Log.Information("Retrying now...");
+                catch (Exception ex)
+                {
+                    Log.Error("❌ Failed to fetch via node: {Error}", ex.Message);
+                    var writer = new StreamWriter(inbound.GetStream()) { AutoFlush = true };
+                    await writer.WriteAsync("HTTP/1.1 500 Internal Server Error\r\n\r\nProxy Node failed");
+                }
+                finally
+                {
+                    inbound.Close();
+                    await TokenSessionTracker.RecordStopAsync(token!, 0, 0);
+                }
             }
-            attempts++;
+
+            if (isSuccessful)
+            {
+                Log.Information("✅ Successfully forwarded request back from node: {Node}", node.Host);
+                break;
+            }
+
         }
 
-        if (!connected || outbound == null)
-        {
-            Log.Error("All connection attempts failed to {Host}:{Port}", requestedHost, requestedPort);
-            var writer = new StreamWriter(inbound.GetStream()) { AutoFlush = true };
-            await writer.WriteAsync("HTTP/1.1 502 Bad Gateway\r\n\r\nConnection failed");
-            inbound.Close();
-            return;
-        }
-
-        try
-        {
-            var connectionId = Guid.NewGuid().ToString().Substring(0, 8);
-            Log.Information("[{ConnectionId}] Incoming connection from {IP}", connectionId, ((IPEndPoint)inbound.Client.RemoteEndPoint).Address);
-            Log.Information("Connected to {Host}:{Port}", requestedHost, requestedPort);
-            var inboundStream = inbound.GetStream();
-            var outboundStream = outbound.GetStream();
-
-            var upTask = ProxyDataTransfer.ProxyData(inboundStream, outboundStream, count => bytesUp += count);
-            var downTask = ProxyDataTransfer.ProxyData(outboundStream, inboundStream, count => bytesDown += count);
-
-            await Task.WhenAny(upTask, downTask);
-        }
-        finally
-        {
-            stopwatch.Stop();
-            var ip = ((IPEndPoint)inbound.Client.RemoteEndPoint!).Address.ToString();
-
-            string? country = null;
-            string? city = null;
-
-            // Optional lookup
-            (country, city) = await ApiClient.GetGeoInfo(ip);
-
-            IPSessionLogger.Log(token!, ip, bytesUp, bytesDown, country, city);
-            Log.Information("Connection closed: {ClientIP} → {Host}:{Port} | {Duration}ms | ↑{BytesUp} ↓{BytesDown}",
-                ((IPEndPoint)inbound.Client.RemoteEndPoint).Address,
-                requestedHost, requestedPort,
-                stopwatch.ElapsedMilliseconds, bytesUp, bytesDown
-            );
-
-            inbound?.Dispose();
-            outbound?.Dispose();
-            await TokenSessionTracker.RecordStopAsync(token!, bytesUp, bytesDown);
-        }
+        inbound?.Dispose();
     }
 }

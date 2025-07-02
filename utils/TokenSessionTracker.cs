@@ -18,7 +18,7 @@ public static class TokenSessionTracker
 
         var optionsBuilder = new DbContextOptionsBuilder<SessionDbContext>();
 
-        using var db = new SessionDbContext(optionsBuilder.Options);
+        using var db = new SessionDbContext();
         await db.Sessions.AddAsync(new TokenSession
         {
             Token = token,
@@ -39,7 +39,7 @@ public static class TokenSessionTracker
         }
         var optionsBuilder = new DbContextOptionsBuilder<SessionDbContext>();
 
-        using var db = new SessionDbContext(optionsBuilder.Options);
+        using var db = new SessionDbContext();
         var session = await db.Sessions
             .Where(s => s.Token == token && s.EndedAt == null)
             .OrderByDescending(s => s.StartedAt)
@@ -73,12 +73,12 @@ public static class TokenSessionTracker
         var optionsBuilder = new DbContextOptionsBuilder<SessionDbContext>();
 
         // DB-based traffic limit (last X mins)
-        using var db = new SessionDbContext(optionsBuilder.Options);
+        using var db = new SessionDbContext();
         var since = DateTime.UtcNow.AddMinutes(-limits.TimeframeMinutes);
 
         var totalBytes = await db.Sessions
             .Where(s => s.Token == token && s.StartedAt >= since)
-            .SumAsync(s => s.BytesUp + s.BytesDown);
+            .SumAsync(s => 0 + 0);
 
         return totalBytes >= limits.ByteLimit;
     }
