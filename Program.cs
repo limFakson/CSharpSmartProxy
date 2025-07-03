@@ -74,129 +74,46 @@ async Task Main()
 
     async Task HandleConnectionAsync(TcpClient inbound)
     {
-        var nodes = UpstreamManager.GetResidentialNodes();
+        using var stream = inbound.GetStream();
+        using var reader = new StreamReader(stream, Encoding.ASCII, false, leaveOpen: true);
+        using var writer = new StreamWriter(stream, Encoding.ASCII, leaveOpen: true) { AutoFlush = true };
 
-        var reader = new StreamReader(inbound.GetStream());
-        var requestLine = await reader.ReadLineAsync();
+        string? requestLine = await reader.ReadLineAsync();
+        if (string.IsNullOrWhiteSpace(requestLine)) return;
+
         var headers = new List<string>();
         string? line;
-
-        bool connected = false;
-        int maxAttempts = 3;
-        int attempts = 0;
-        bool isSuccessful = false;
-
         while (!string.IsNullOrWhiteSpace(line = await reader.ReadLineAsync()))
+        {
             headers.Add(line);
-
-        if(!headers.Contains("X-Forwarded-Host:") || !headers.Contains("X-Proxy-Token:"))
-        {
-            Log.Warning($"[INVALID] Invalid request from {((IPEndPoint)inbound.Client.RemoteEndPoint).Address}");
-            var writer = new StreamWriter(inbound.GetStream()) { AutoFlush = true };
-            await writer.WriteAsync("HTTP/1.1 404 Bad Request\r\n\r\nInvalid request X-Proxy-Token or X-Forwarded-Host header not found in request.");
-            inbound.Close();
-            return;
         }
 
+        Log.Information("Received request: {Headers}", requestLine);
         string? token = headers.FirstOrDefault(h => h.StartsWith("X-Proxy-Token:"))?.Split(":", 2)[1].Trim();
-        string? forwardedHost = headers.FirstOrDefault(h => h.StartsWith("X-Forwarded-Host:"))?.Split(":", 2)[1].Trim();
+        string? hostHeader = headers.FirstOrDefault(h => h.StartsWith("Host:"))?.Split(":", 2)[1].Trim();
 
-        if (token == null || forwardedHost == null)
-        {
-            var writer = new StreamWriter(inbound.GetStream()) { AutoFlush = true };
-            await writer.WriteAsync("HTTP/1.1 400 Bad Request\r\n\r\nMissing token or host header");
-            inbound.Close();
-            return;
-        }
+        // if (string.IsNullOrWhiteSpace(token) || string.IsNullOrWhiteSpace(hostHeader))
+        // {
+        //     await writer.WriteAsync("HTTP/1.1 400 Bad Request\r\n\r\nMissing Token or Host");
+        //     return;
+        // }
 
-        if (string.IsNullOrWhiteSpace(token) || !validPSQLTokens.Contains(token))
-        {
-            Log.Warning($"[AUTH] Rejected connection from {((IPEndPoint)inbound.Client.RemoteEndPoint).Address}");
-            var writer = new StreamWriter(inbound.GetStream()) { AutoFlush = true };
-            await writer.WriteAsync("HTTP/1.1 403 Forbidden\r\n\r\nUnauthorized");
-            Log.Error($"Invalid or missing token, token is null - {string.IsNullOrWhiteSpace(token)} or it not in validPSQLTokens - {validPSQLTokens.Contains(token)}");
-            inbound.Close();
-            return;
-        }
+        // // Check token in DB (implement actual validation as needed)
+        // if (!validPSQLTokens.Contains(token))
+        // {
+        //     await writer.WriteAsync("HTTP/1.1 403 Forbidden\r\n\r\nInvalid Token");
+        //     return;
+        // }
 
-        try
-        {
-            Console.WriteLine("🔍 About to check if token is blocked");
-            if (await TokenSessionTracker.IsTokenBlocked(token, limitSettings))
-            {
-                Log.Warning("Blocked token tried to connect: {Token}", token);
-                var writer = new StreamWriter(inbound.GetStream()) { AutoFlush = true };
-                await writer.WriteAsync("HTTP/1.1 429 Too Many Requests\r\n\r\nBlocked or throttled");
-                inbound.Close();
-                return;
-            }
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine($"🔥 condition error in IsTokenBlocked: {ex.Message}");
-        }
+        var parts = requestLine.Split(' ');
+        if (parts.Length < 2) return;
 
-        if (nodes == null)
-        {
-            Log.Warning("No live residential node available.");
-            var writer = new StreamWriter(inbound.GetStream()) { AutoFlush = true };
-            await writer.WriteAsync("HTTP/1.1 502 Bad Gateway\r\n\r\nNo residential node available");
-            inbound.Close();
-            return;
-        }
+        var method = parts[0];
+        var target = parts[1];
 
-        var httpClient = new HttpClient();
-        var payload = new
-        {
-            method = "GET",
-            url = $"https://{forwardedHost}",
-            headers = headers.ToDictionary(
-                h => h.Split(":", 2)[0].Trim(),
-                h => h.Split(":", 2)[1].Trim())
-        };
-
-        var json = JsonSerializer.Serialize(payload);
-        var content = new StringContent(json, Encoding.UTF8, "application/json");
-
-        await TokenSessionTracker.RecordStartAsync(token!);
-        foreach (var node in nodes)
-        {
-            while (!connected && attempts < maxAttempts)
-            {
-                Log.Information("🔄 Attempt {Attempt} to connect to node: {Node}", attempts + 1, node.Host);
-                try
-                {
-                    Log.Information("🔗 Forwarding request to node: {Node}", node.Host);
-                    var response = await httpClient.PostAsync($"http://{node.Host}:{node.Port}/proxy-request", content);
-                    var responseBody = await response.Content.ReadAsByteArrayAsync();
-                    connected = true;
-
-                    var writer = new StreamWriter(inbound.GetStream()) { AutoFlush = true };
-                    await writer.WriteAsync("HTTP/1.1 200 OK\r\n\r\n");
-                    await inbound.GetStream().WriteAsync(responseBody);
-                    isSuccessful = true;
-                }
-                catch (Exception ex)
-                {
-                    Log.Error("❌ Failed to fetch via node: {Error}", ex.Message);
-                    var writer = new StreamWriter(inbound.GetStream()) { AutoFlush = true };
-                    await writer.WriteAsync("HTTP/1.1 500 Internal Server Error\r\n\r\nProxy Node failed");
-                }
-                finally
-                {
-                    inbound.Close();
-                    await TokenSessionTracker.RecordStopAsync(token!, 0, 0);
-                }
-            }
-
-            if (isSuccessful)
-            {
-                Log.Information("✅ Successfully forwarded request back from node: {Node}", node.Host);
-                break;
-            }
-
-        }
-
-        inbound?.Dispose();
+        if (method.ToUpper() == "CONNECT")
+            await ProxyHandler.HandleHttpsTunnelAsync(inbound, target, headers, token);
+        else
+            await ProxyHandler.HandleHttpForwardAsync(inbound, requestLine, reader, stream, headers, token);
     }
 }

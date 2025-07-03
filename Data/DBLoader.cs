@@ -11,7 +11,16 @@ public static class DBLoader
         using (var db = new PostgresDbContext(optionsBuilder.Options))
         {
             db.Database.Migrate(); // Apply pending migrations
-            Log.Information("PostgresSQL DB is ready.");
+            Log.Information("Postgres DB is ready.");
+        }
+
+        var proxyOptionsBuilder = new DbContextOptionsBuilder<ProxyDbContext>();
+        proxyOptionsBuilder.UseNpgsql(Environment.GetEnvironmentVariable("POSTGRES_URL")!);
+
+        using (var proxyDb = new ProxyDbContext(proxyOptionsBuilder.Options))
+        {
+            proxyDb.Database.Migrate(); // Apply pending migrations
+            Log.Information("Proxy DB is ready.");
         }
 
         // Load SQLite DB
@@ -28,6 +37,16 @@ public static class DBLoader
             Log.Error("ProxyTokens table does not exist in the database. Please run migrations.");
             return "ProxyTokens table does not exist in the database. Please run migrations.";
         }
+
+        bool proxyExists = await TokenFetcher.TableExistsAsync("Nodes");
+        Log.Information("Checking if Nodes table exists: {Exists}", proxyExists);
+        if (!proxyExists)
+        {
+            Log.Error("Nodes table does not exist in the database. Please run migrations.");
+            return "Nodes table does not exist in the database. Please run migrations.";
+        }
+
+        UpstreamManager.LoadFromDatabase();
         return "Databases are ready.";
     }
 }

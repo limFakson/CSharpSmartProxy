@@ -185,6 +185,9 @@ DocProject/Help/html
 # Click-Once directory
 publish/
 
+# Database file and database log files
+*.db
+
 # Publish Web Output
 *.[Pp]ublish.xml
 *.azurePubxml

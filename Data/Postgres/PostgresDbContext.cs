@@ -1,7 +1,6 @@
 using Npgsql.EntityFrameworkCore.PostgreSQL;
 using Microsoft.EntityFrameworkCore;
 using Npgsql;
-using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Design;
 
 public class DesignTimePostgresDbContextFactory : IDesignTimeDbContextFactory<PostgresDbContext>

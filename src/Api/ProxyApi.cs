@@ -81,11 +81,21 @@ public static class ProxyApi
         {
             var nodes = UpstreamManager.GetResidentialNodes();
 
-            if (nodes.Count == 0)
-            {
-                return Results.NotFound(new { error = "No online nodes available" });
-            }
+            // if (nodes.Count == 0)
+            // {
+            //     return Results.NotFound(new { error = "No online nodes available" });
+            // }
             return Results.Json(nodes);
+        });
+
+        app.MapPost("/api/nodes/ping", async (HttpContext ctx) =>
+        {
+            var pingData = await ctx.Request.ReadFromJsonAsync<UpstreamPing>();
+            if (pingData == null || string.IsNullOrWhiteSpace(pingData.Host))
+                return Results.BadRequest(new { error = "Invalid ping data" });
+
+            UpstreamManager.NodePing(pingData);
+            return Results.Ok(new { message = $"Node {pingData.Host}:{pingData.Port} pinged." });
         });
 
         return app;
