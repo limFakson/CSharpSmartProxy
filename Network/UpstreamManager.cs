@@ -2,11 +2,13 @@ using System;
 using System.Collections.Generic;
 using System.Linq;
 using Microsoft.EntityFrameworkCore;
+using Serilog;
 
 public static class UpstreamManager
 {
     private static readonly List<UpstreamTarget> Nodes = new();
     private static int currentIndex = 0;
+    private static readonly TimeSpan ExpiryThreshold = TimeSpan.FromSeconds(190);
     private static readonly object LockObj = new();
 
     public static void LoadFromDatabase()
@@ -76,23 +78,25 @@ public static class UpstreamManager
         }
     }
 
-    public static void MarkOffline(string host, int port)
+    public static void MarkOffline()
     {
         lock (LockObj)
         {
+            var now = DateTime.UtcNow;
             using var db = new ProxyDbContext(DatabaseUtils.GetOptions());
 
-            var node = db.Nodes.FirstOrDefault(n => n.Host == host && n.Port == port);
-            if (node != null)
+            var nodes = db.Nodes.Where(n => n.IsOnline && (now - n.LastChecked) > ExpiryThreshold).ToList();
+            if (nodes.Count > 0)
             {
-                node.IsOnline = false;
-                node.LastChecked = DateTime.UtcNow;
-                db.SaveChanges();
+                foreach (var node in nodes)
+                {
+                    node.IsOnline = false;
+                    node.LastChecked = DateTime.UtcNow;
+                    db.SaveChanges();
+                }
             }
-
-            var memNode = Nodes.FirstOrDefault(n => n.Host == host && n.Port == port);
-            if (memNode != null)
-                memNode.IsOnline = false;
+            Log.Information($"{nodes.Count} has been marked offline for being inactive for 3mins");
+            LoadFromDatabase();
         }
     }
 
